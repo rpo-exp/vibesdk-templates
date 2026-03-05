@@ -1,0 +1,165 @@
+name: Cleanup Branch Resources
+
+on:
+  delete:
+    branches:
+      - '**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-rpotential-frontends
+  DNS_ZONE_NAME: cog.rpotential.dev
+  DNS_RESOURCE_GROUP: rg-dns-management
+
+jobs:
+  cleanup:
+    # Don't delete main or develop SWAs, only feature branches
+    if: github.event.ref != 'main' && github.event.ref != 'develop' && github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    name: Cleanup Branch Resources
+    environment: development
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract branch and repository info
+        id: extract_info
+        run: |
+          # Get the deleted branch name from the event
+          BRANCH_NAME="${{ github.event.ref }}"
+          BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[\/_ ]/-/g' | tr '[:upper:]' '[:lower:]')
+          
+          # Extract repository name (without org)
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+          
+          # Generate custom domain and DNS record name
+          CUSTOM_DOMAIN="${BRANCH_NAME}-${REPO_NAME}.${DNS_ZONE_NAME}"
+          RECORD_NAME="${BRANCH_NAME}-${REPO_NAME}"
+          
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "custom_domain=$CUSTOM_DOMAIN" >> $GITHUB_OUTPUT
+          echo "record_name=$RECORD_NAME" >> $GITHUB_OUTPUT
+          
+          echo "Branch: $BRANCH_NAME"
+          echo "Repository: $REPO_NAME"
+          echo "Custom Domain: $CUSTOM_DOMAIN"
+          echo "DNS Record: $RECORD_NAME"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Static Web App name
+        id: get_swa
+        run: |
+          BRANCH_NAME="${{ steps.extract_info.outputs.branch_name }}"
+          REPO_NAME="${{ steps.extract_info.outputs.repo_name }}"
+          STATIC_WEB_APP_NAME="swa-${BRANCH_NAME}-${REPO_NAME}"
+          echo "swa_name=$STATIC_WEB_APP_NAME" >> $GITHUB_OUTPUT
+          echo "Static Web App: $STATIC_WEB_APP_NAME"
+
+      - name: Remove custom domain from Static Web App
+        continue-on-error: true
+        run: |
+          CUSTOM_DOMAIN="${{ steps.extract_info.outputs.custom_domain }}"
+          SWA_NAME="${{ steps.get_swa.outputs.swa_name }}"
+          
+          echo "Checking if Static Web App exists: $SWA_NAME"
+          
+          # Check if Static Web App exists
+          if ! az staticwebapp show \
+            --name "$SWA_NAME" \
+            --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "Static Web App does not exist, skipping domain removal"
+            exit 0
+          fi
+          
+          echo "Checking if custom domain exists: $CUSTOM_DOMAIN"
+          
+          # Check if custom domain exists
+          if az staticwebapp hostname show \
+            --name "$SWA_NAME" \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --hostname "$CUSTOM_DOMAIN" &>/dev/null; then
+            
+            echo "Removing custom domain from Static Web App..."
+            az staticwebapp hostname delete \
+              --name "$SWA_NAME" \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --hostname "$CUSTOM_DOMAIN" \
+              --yes
+            
+            echo "✓ Custom domain removed: $CUSTOM_DOMAIN"
+          else
+            echo "Custom domain not found, skipping"
+          fi
+
+      - name: Delete DNS CNAME record
+        continue-on-error: true
+        run: |
+          RECORD_NAME="${{ steps.extract_info.outputs.record_name }}"
+          
+          echo "Checking if DNS record exists: $RECORD_NAME"
+          
+          # Check if DNS CNAME record exists
+          if az network dns record-set cname show \
+            --name "$RECORD_NAME" \
+            --zone-name "${{ env.DNS_ZONE_NAME }}" \
+            --resource-group "${{ env.DNS_RESOURCE_GROUP }}" &>/dev/null; then
+            
+            echo "Deleting DNS CNAME record..."
+            az network dns record-set cname delete \
+              --name "$RECORD_NAME" \
+              --zone-name "${{ env.DNS_ZONE_NAME }}" \
+              --resource-group "${{ env.DNS_RESOURCE_GROUP }}" \
+              --yes
+            
+            echo "✓ DNS CNAME record deleted: $RECORD_NAME"
+          else
+            echo "DNS record not found, skipping"
+          fi
+
+      - name: Delete Static Web App
+        continue-on-error: true
+        run: |
+          SWA_NAME="${{ steps.get_swa.outputs.swa_name }}"
+          
+          echo "Checking if Static Web App exists: $SWA_NAME"
+          
+          # Check if Static Web App exists and delete it
+          if az staticwebapp show \
+            --name "$SWA_NAME" \
+            --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            
+            echo "Deleting Static Web App: $SWA_NAME"
+            az staticwebapp delete \
+              --name "$SWA_NAME" \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --yes
+            
+            echo "✓ Static Web App deleted: $SWA_NAME"
+          else
+            echo "Static Web App not found, skipping"
+          fi
+
+      - name: Cleanup Summary
+        run: |
+          echo "============================================"
+          echo "Cleanup Complete!"
+          echo "============================================"
+          echo ""
+          echo "Deleted Branch: ${{ steps.extract_info.outputs.branch_name }}"
+          echo "Static Web App Deleted: ${{ steps.get_swa.outputs.swa_name }}"
+          echo "Custom Domain Removed: ${{ steps.extract_info.outputs.custom_domain }}"
+          echo "DNS Record Deleted: ${{ steps.extract_info.outputs.record_name }}"
+          echo ""
+          echo "All resources for this branch have been cleaned up."
+          echo "============================================"
