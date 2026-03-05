@@ -1,7 +1,0 @@
-name: "hello-world-frontend"
-description: "Simple environment-aware frontend template inspired by the hello-world-frontend static app"
-base_reference: "vite-reference"
-projectType: app
-
-package_patches:
-  name: "hello-world-frontend"
