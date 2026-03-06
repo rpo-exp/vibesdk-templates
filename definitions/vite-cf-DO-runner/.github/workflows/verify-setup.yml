@@ -1,0 +1,199 @@
+name: Verify Azure Setup
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-rpotential-frontends
+  STATIC_WEB_APP_NAME: swa-rpotential-example-frontend
+  DNS_ZONE_NAME: cog.rpotential.dev
+  DNS_RESOURCE_GROUP: rg-dns-management
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    name: Verify Azure Configuration
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        id: azure_login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure authentication
+        run: |
+          echo "============================================"
+          echo "1. Verifying Azure Authentication"
+          echo "============================================"
+
+          ACCOUNT_INFO=$(az account show)
+          echo "✅ Successfully authenticated to Azure"
+          echo ""
+          echo "Account Details:"
+          echo "$ACCOUNT_INFO" | jq '{name, id, tenantId, user}'
+          echo ""
+
+      - name: Verify Static Web App access
+        run: |
+          echo "============================================"
+          echo "2. Verifying Static Web App Access"
+          echo "============================================"
+
+          # Check if we can view the Static Web App
+          SWA_INFO=$(az staticwebapp show \
+            --name ${{ env.STATIC_WEB_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }})
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Can access Static Web App: ${{ env.STATIC_WEB_APP_NAME }}"
+            echo ""
+            echo "Static Web App Details:"
+            echo "$SWA_INFO" | jq '{name, defaultHostname, location, sku}'
+            echo ""
+          else
+            echo "❌ Cannot access Static Web App"
+            exit 1
+          fi
+
+      - name: Verify deployment token access
+        run: |
+          echo "============================================"
+          echo "3. Verifying Deployment Token Access"
+          echo "============================================"
+
+          # Try to get the deployment token
+          SWA_TOKEN=$(az staticwebapp secrets list \
+            --name ${{ env.STATIC_WEB_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.apiKey" -o tsv)
+
+          if [ -n "$SWA_TOKEN" ]; then
+            echo "✅ Can retrieve deployment token"
+            echo "Token length: ${#SWA_TOKEN} characters"
+            echo ""
+          else
+            echo "❌ Cannot retrieve deployment token"
+            exit 1
+          fi
+
+      - name: Verify DNS zone access
+        run: |
+          echo "============================================"
+          echo "4. Verifying DNS Zone Access"
+          echo "============================================"
+
+          # Check if we can view the DNS zone
+          DNS_INFO=$(az network dns zone show \
+            --name ${{ env.DNS_ZONE_NAME }} \
+            --resource-group ${{ env.DNS_RESOURCE_GROUP }})
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Can access DNS zone: ${{ env.DNS_ZONE_NAME }}"
+            echo ""
+            echo "DNS Zone Details:"
+            echo "$DNS_INFO" | jq '{name, numberOfRecordSets, resourceGroup}'
+            echo ""
+          else
+            echo "❌ Cannot access DNS zone"
+            exit 1
+          fi
+
+      - name: Verify DNS record creation permissions
+        run: |
+          echo "============================================"
+          echo "5. Verifying DNS Record Permissions"
+          echo "============================================"
+
+          # Try to create a test CNAME record
+          TEST_RECORD="test-verify-$(date +%s)"
+
+          echo "Creating test CNAME record: $TEST_RECORD"
+          az network dns record-set cname create \
+            --name "$TEST_RECORD" \
+            --zone-name "${{ env.DNS_ZONE_NAME }}" \
+            --resource-group "${{ env.DNS_RESOURCE_GROUP }}" \
+            --ttl 60
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Can create DNS CNAME records"
+
+            # Clean up test record
+            echo "Cleaning up test record..."
+            az network dns record-set cname delete \
+              --name "$TEST_RECORD" \
+              --zone-name "${{ env.DNS_ZONE_NAME }}" \
+              --resource-group "${{ env.DNS_RESOURCE_GROUP }}" \
+              --yes
+
+            echo "Test record deleted"
+            echo ""
+          else
+            echo "❌ Cannot create DNS records"
+            exit 1
+          fi
+
+      - name: Verify custom domain management
+        run: |
+          echo "============================================"
+          echo "6. Verifying Custom Domain Management"
+          echo "============================================"
+
+          # List custom domains
+          CUSTOM_DOMAINS=$(az staticwebapp hostname list \
+            --name ${{ env.STATIC_WEB_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }})
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Can list custom domains"
+            echo ""
+            echo "Current custom domains:"
+            echo "$CUSTOM_DOMAINS" | jq -r '.[].name' || echo "No custom domains configured"
+            echo ""
+          else
+            echo "❌ Cannot list custom domains"
+            exit 1
+          fi
+
+      - name: List required GitHub secrets
+        run: |
+          echo "============================================"
+          echo "7. GitHub Secrets Configuration"
+          echo "============================================"
+          echo ""
+          echo "Required secrets (configured via GitHub Actions secrets):"
+          echo ""
+          echo "✅ AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID != '' && 'Set' || 'NOT SET' }}"
+          echo "✅ AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID != '' && 'Set' || 'NOT SET' }}"
+          echo "✅ AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID != '' && 'Set' || 'NOT SET' }}"
+          echo ""
+
+      - name: Verification Summary
+        run: |
+          echo ""
+          echo "============================================"
+          echo "✅ ALL VERIFICATIONS PASSED!"
+          echo "============================================"
+          echo ""
+          echo "Your GitHub Actions are configured correctly to:"
+          echo "  ✅ Authenticate to Azure using OIDC"
+          echo "  ✅ Access Static Web App: ${{ env.STATIC_WEB_APP_NAME }}"
+          echo "  ✅ Retrieve deployment tokens"
+          echo "  ✅ Manage DNS records in: ${{ env.DNS_ZONE_NAME }}"
+          echo "  ✅ Configure custom domains"
+          echo ""
+          echo "You can now:"
+          echo "  1. Push code to trigger automatic deployment"
+          echo "  2. Custom domains will be configured automatically"
+          echo "  3. SSL certificates will be provisioned automatically"
+          echo ""
+          echo "============================================"

@@ -1,0 +1,261 @@
+name: Deploy to Azure Static Web Apps
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'release/**'
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+      - develop
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  RESOURCE_GROUP: rg-rpotential-frontends
+  DNS_ZONE_NAME: cog.rpotential.dev
+  DNS_RESOURCE_GROUP: rg-dns-management
+
+jobs:
+  build_and_deploy:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    name: Build and Deploy
+    environment: development
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Extract branch name and repository name
+        id: extract_info
+        run: |
+          # Extract and sanitize branch name
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[\/_ ]/-/g' | tr '[:upper:]' '[:lower:]')
+
+          # Extract repository name (without org)
+          REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
+
+          # Each branch gets its own Static Web App
+          STATIC_WEB_APP_NAME="swa-${BRANCH_NAME}-hello-world-frontend"
+
+          # Generate custom domain
+          CUSTOM_DOMAIN="${BRANCH_NAME}-${REPO_NAME}.${DNS_ZONE_NAME}"
+
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "custom_domain=$CUSTOM_DOMAIN" >> $GITHUB_OUTPUT
+          echo "swa_name=$STATIC_WEB_APP_NAME" >> $GITHUB_OUTPUT
+
+          echo "Branch: $BRANCH_NAME"
+          echo "Repository: $REPO_NAME"
+          echo "Static Web App: $STATIC_WEB_APP_NAME"
+          echo "Custom Domain: $CUSTOM_DOMAIN"
+
+      - name: Build app
+        run: |
+          mkdir -p dist
+          cp -rf src/* dist/
+
+          # Create build metadata file
+          cat > dist/build-info.json << EOF
+          {
+            "branch": "${{ steps.extract_info.outputs.branch_name }}",
+            "repository": "${{ steps.extract_info.outputs.repo_name }}",
+            "domain": "${{ steps.extract_info.outputs.custom_domain }}",
+            "commit": "${{ github.sha }}",
+            "runNumber": "${{ github.run_number }}",
+            "buildDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          echo "Build complete. Files in dist/:"
+          ls -la dist/
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision Static Web App if needed
+        id: provision_swa
+        run: |
+          SWA_NAME="${{ steps.extract_info.outputs.swa_name }}"
+          
+          echo "Checking if Static Web App exists: $SWA_NAME"
+          
+          # Check if Static Web App exists
+          if az staticwebapp show --name "$SWA_NAME" --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "✅ Static Web App $SWA_NAME already exists"
+            echo "swa_created=false" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 Creating new Static Web App: $SWA_NAME"
+            az staticwebapp create \
+              --name "$SWA_NAME" \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --location "East US 2" \
+              --sku "Standard"
+            
+            if [ $? -eq 0 ]; then
+              echo "✅ Static Web App $SWA_NAME created successfully"
+              echo "swa_created=true" >> $GITHUB_OUTPUT
+              
+              # Wait for resource to be fully provisioned
+              sleep 10
+            else
+              echo "❌ Failed to create Static Web App $SWA_NAME"
+              exit 1
+            fi
+          fi
+
+      - name: Get Static Web App deployment token
+        id: swa_token
+        run: |
+          SWA_TOKEN=$(az staticwebapp secrets list \
+            --name ${{ steps.extract_info.outputs.swa_name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.apiKey" -o tsv)
+
+          echo "::add-mask::$SWA_TOKEN"
+          echo "deployment_token=$SWA_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Azure Static Web Apps
+        id: deploy_swa
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa_token.outputs.deployment_token }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "dist"
+          api_location: ""
+          output_location: ""
+          skip_app_build: true
+
+      - name: Setup custom domain DNS
+        run: |
+          BRANCH_NAME="${{ steps.extract_info.outputs.branch_name }}"
+          REPO_NAME="${{ steps.extract_info.outputs.repo_name }}"
+          CUSTOM_DOMAIN="${{ steps.extract_info.outputs.custom_domain }}"
+          SWA_NAME="${{ steps.extract_info.outputs.swa_name }}"
+
+          echo "Setting up DNS for: $CUSTOM_DOMAIN"
+
+          # Get the default hostname for the static web app
+          DEFAULT_HOSTNAME=$(az staticwebapp show \
+            --name $SWA_NAME \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "defaultHostname" -o tsv)
+
+          echo "Default hostname: $DEFAULT_HOSTNAME"
+
+          # Create DNS CNAME record (or update if exists)
+          RECORD_NAME="${BRANCH_NAME}-${REPO_NAME}"
+
+          # Check if CNAME record exists
+          if az network dns record-set cname show \
+            --name "$RECORD_NAME" \
+            --zone-name "${{ env.DNS_ZONE_NAME }}" \
+            --resource-group "${{ env.DNS_RESOURCE_GROUP }}" &>/dev/null; then
+            echo "Updating existing CNAME record: $RECORD_NAME"
+            az network dns record-set cname set-record \
+              --record-set-name "$RECORD_NAME" \
+              --zone-name "${{ env.DNS_ZONE_NAME }}" \
+              --resource-group "${{ env.DNS_RESOURCE_GROUP }}" \
+              --cname "$DEFAULT_HOSTNAME"
+          else
+            echo "Creating new CNAME record: $RECORD_NAME"
+            az network dns record-set cname create \
+              --name "$RECORD_NAME" \
+              --zone-name "${{ env.DNS_ZONE_NAME }}" \
+              --resource-group "${{ env.DNS_RESOURCE_GROUP }}" \
+              --ttl 300
+
+            az network dns record-set cname set-record \
+              --record-set-name "$RECORD_NAME" \
+              --zone-name "${{ env.DNS_ZONE_NAME }}" \
+              --resource-group "${{ env.DNS_RESOURCE_GROUP }}" \
+              --cname "$DEFAULT_HOSTNAME"
+          fi
+
+          echo "DNS CNAME record configured: $RECORD_NAME -> $DEFAULT_HOSTNAME"
+
+      - name: Add custom domain to Static Web App
+        continue-on-error: true
+        run: |
+          CUSTOM_DOMAIN="${{ steps.extract_info.outputs.custom_domain }}"
+          SWA_NAME="${{ steps.extract_info.outputs.swa_name }}"
+
+          echo "Adding custom domain to Static Web App: $CUSTOM_DOMAIN"
+          echo "Waiting 30 seconds for DNS propagation..."
+          sleep 30
+
+          # Add custom domain to Static Web App
+          az staticwebapp hostname set \
+            --name $SWA_NAME \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --hostname "$CUSTOM_DOMAIN" || true
+
+          echo "Custom domain setup initiated (may take a few minutes for SSL certificate)"
+
+      - name: Deployment Summary
+        run: |
+          echo "============================================"
+          echo "Deployment Complete!"
+          echo "============================================"
+          echo ""
+          echo "Custom Domain: https://${{ steps.extract_info.outputs.custom_domain }}"
+          echo "Default Domain: ${{ steps.deploy_swa.outputs.static_web_app_url }}"
+          echo ""
+          echo "Branch: ${{ steps.extract_info.outputs.branch_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "============================================"
+
+  close_pull_request:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    name: Close Pull Request
+    environment: development
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Static Web App deployment token
+        id: swa_token
+        run: |
+          # PRs use the shared SWA
+          SWA_TOKEN=$(az staticwebapp secrets list \
+            --name swa-rpotential-steve-experience \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.apiKey" -o tsv)
+
+          echo "::add-mask::$SWA_TOKEN"
+          echo "deployment_token=$SWA_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Close Pull Request Environment
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa_token.outputs.deployment_token }}
+          action: "close"
